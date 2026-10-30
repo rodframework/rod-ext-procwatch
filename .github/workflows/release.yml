@@ -1,0 +1,122 @@
+name: release
+
+# The official release path (the custody rule architecture.md Sec 15.2
+# records): a maintainer pushes a version tag, this workflow builds and
+# signs the package with the organization publisher key held as an
+# organization secret, proves it installs, and publishes. The key never
+# sits on a person's machine; the tag pusher is the release gate, and
+# the registry's sync-entries workflow lands the index entry by pull
+# request, the same publication-is-a-PR gate a community publisher
+# rides.
+#
+# A dispatch run is the validate-only pass (rebuild, sign, prove the
+# install chain, publish nothing); a tag push against an already
+# released tag degrades to the same pass -- a rebuilt binary is not
+# byte-identical, so an indexed version is never silently replaced.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'The ref to build (empty for the default branch)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout the module
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - name: Checkout the platform tree
+        # The rod CLI builds from the platform repository, and a plugin
+        # package's execution half compiles from the Rust tree beside it
+        # (ROD_RUST_TREE below). Until the implant split pins a source
+        # tarball, the platform's main branch is the reference the
+        # official packages build against.
+        uses: actions/checkout@v5
+        with:
+          repository: rodframework/Rod
+          path: rod
+          fetch-depth: 1
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: rod/global.json
+      - name: Build the rod CLI
+        run: dotnet build rod/src/cli/dotnet/Rod.Cli.csproj --configuration Release
+      - name: Read the manifest
+        id: manifest
+        run: |
+          name=$(grep -m1 '^name = ' rod-module.toml | sed 's/name = "\(.*\)"/\1/')
+          version=$(grep -m1 '^version = ' rod-module.toml | sed 's/version = "\(.*\)"/\1/')
+          entry=$(grep -m1 '^entry = ' rod-module.toml | sed 's/entry = "\(.*\)"/\1/')
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "entry=$entry" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref_name }}" != "v$version" ]; then
+            echo "::error::tag ${{ github.ref_name }} does not match the manifest version v$version"
+            exit 1
+          fi
+      - name: Build the plugin artifact
+        if: steps.manifest.outputs.entry == 'plugin'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq protobuf-compiler >/dev/null
+          ROD_RUST_TREE="$GITHUB_WORKSPACE/rod/src/implant/rust" ./build.sh
+      - name: Sign and publish into a staging index
+        env:
+          ROD_ORG_PUBLISH_KEY: ${{ secrets.ROD_ORG_PUBLISH_KEY }}
+        run: |
+          printf '%s\n' "$ROD_ORG_PUBLISH_KEY" > rod-module.key
+          dotnet run --project rod/src/cli/dotnet --no-build --configuration Release -- \
+            mod publish --path . --key rod-module.key --registry staging --out dist
+          rm -f rod-module.key
+      - name: Prove the package installs
+        run: |
+          dotnet run --project rod/src/cli/dotnet --no-build --configuration Release -- \
+            mod install \
+            "${{ steps.manifest.outputs.name }}@${{ steps.manifest.outputs.version }}" \
+            --registry staging --dir install-proof
+      - name: Point the index entry at the release asset
+        env:
+          MODULE_NAME: ${{ steps.manifest.outputs.name }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          repo = os.environ['GITHUB_REPOSITORY']
+          name = os.environ['MODULE_NAME']
+          entry = json.load(open(f'staging/modules/{name}.json'))
+          for version in entry['versions']:
+              tag = 'v' + version['version']
+              version['url'] = (f'https://github.com/{repo}/releases/download/'
+                                f'{tag}/{name}-{version["version"]}.zip')
+          with open('dist/registry-entry.json', 'w') as f:
+              json.dump(entry, f, indent=2)
+              f.write('\n')
+          PY
+      - name: Publish the release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          name="${{ steps.manifest.outputs.name }}"
+          version="${{ steps.manifest.outputs.version }}"
+          tag="v$version"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::notice::release $tag already exists; this run stands as the validate-only pass, nothing overwritten."
+            exit 0
+          fi
+          fingerprint=$(jq -r '.versions[0].fingerprint' "staging/modules/$name.json")
+          gh release create "$tag" \
+            --title "$name $version" \
+            --notes "Signed package $name-$version.zip, built and signed by the release workflow (publisher fingerprint $fingerprint). registry-entry.json carries the index entry the registry's sync workflow lands by pull request." \
+            "dist/$name-$version.zip" \
+            "dist/registry-entry.json"
